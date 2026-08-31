@@ -134,6 +134,32 @@ def read_root():
 def health_check():
     return {"status": "healthy"}
 
+@app.get("/admin/orders")
+def get_all_orders():
+    """Retrieve all saved order records from orders.xlsx."""
+    if not os.path.exists(ORDERS_EXCEL_FILE_PATH):
+        return []
+    try:
+        df = pd.read_excel(ORDERS_EXCEL_FILE_PATH)
+        df = df.where(pd.notnull(df), None)
+        return df.to_dict(orient="records")
+    except Exception as e:
+        print(f"Error reading orders Excel sheet: {e}")
+        return []
+
+@app.get("/admin/customers")
+def get_all_customers():
+    """Retrieve all saved customer records from customers.xlsx."""
+    if not os.path.exists(CUSTOMERS_EXCEL_FILE_PATH):
+        return []
+    try:
+        df = pd.read_excel(CUSTOMERS_EXCEL_FILE_PATH)
+        df = df.where(pd.notnull(df), None)
+        return df.to_dict(orient="records")
+    except Exception as e:
+        print(f"Error reading customers Excel sheet: {e}")
+        return []
+
 @app.get("/pincodes")
 def check_pincode(code: str):
     """Check if a specific pincode is serviceable by searching the Excel sheet."""

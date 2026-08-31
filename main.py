@@ -129,6 +129,11 @@ def read_pincodes_from_excel() -> List[dict]:
 def read_root():
     return {"message": "Welcome to BloomCakes Backend API. Visit /docs for Swagger specifications documentation."}
 
+@app.get("/health")
+@app.get("/healthz")
+def health_check():
+    return {"status": "healthy"}
+
 @app.get("/pincodes")
 def check_pincode(code: str):
     """Check if a specific pincode is serviceable by searching the Excel sheet."""

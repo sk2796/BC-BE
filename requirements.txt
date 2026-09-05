@@ -5,3 +5,7 @@ pandas
 openpyxl
 razorpay
 python-dotenv
+sqlalchemy
+pymysql
+cryptography
+

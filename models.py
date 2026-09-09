@@ -30,6 +30,7 @@ class OrderModel(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     order_id = Column(String(100), index=True, nullable=False)
+    customer_id = Column(String(100), index=True, nullable=True)
     name = Column(String(255), nullable=False)
     phone = Column(String(20), nullable=False, index=True)
     email = Column(String(255), nullable=True)
@@ -45,6 +46,7 @@ class OrderModel(Base):
     activePromo = Column(String(100), nullable=True)
     discountAmount = Column(Integer, default=0)
     totalAmount = Column(Integer, nullable=False)
+    status = Column(String(50), default="order_confirmed")
     created_at = Column(String(50), default=lambda: datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
 
 class CustomerModel(Base):
@@ -55,7 +57,24 @@ class CustomerModel(Base):
     name = Column(String(255), nullable=False)
     phone = Column(String(20), nullable=False, unique=True, index=True)
     email = Column(String(255), nullable=True)
+    password_hash = Column(String(255), nullable=True)
+    reset_token = Column(String(255), nullable=True, index=True)
+    reset_token_expiry = Column(String(50), nullable=True)
     city = Column(String(100), nullable=True)
     state = Column(String(100), nullable=True)
     pincode = Column(String(20), nullable=True)
+    created_at = Column(String(50), default=lambda: datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    updated_at = Column(String(50), default=lambda: datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+
+class AdminUserModel(Base):
+    __tablename__ = "admin_users"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    admin_id = Column(String(100), index=True, nullable=False, unique=True)
+    name = Column(String(255), nullable=False)
+    email = Column(String(255), nullable=False, unique=True, index=True)
+    password_hash = Column(String(255), nullable=False)
+    role = Column(String(50), nullable=False, default="manager") # super_admin, manager, delivery_staff, catalog_editor
+    is_active = Column(Boolean, default=True)
+    created_at = Column(String(50), default=lambda: datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
     updated_at = Column(String(50), default=lambda: datetime.now().strftime("%Y-%m-%d %H:%M:%S"))

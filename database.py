@@ -10,10 +10,12 @@ DATABASE_URL = os.getenv(
     "mysql+pymysql://u_hPcMes:CnJtnSaxc6Uz@sql.freedb.tech:3306/freedb_Sh0rGH8z"
 )
 
-# Pool recycle & pre_ping to handle MySQL disconnects / idle timeouts on remote server
+from sqlalchemy.pool import NullPool
+
+# Use NullPool to open and immediately close connections on request completion, avoiding connection leaks
 engine = create_engine(
     DATABASE_URL,
-    pool_recycle=300,
+    poolclass=NullPool,
     pool_pre_ping=True
 )
 

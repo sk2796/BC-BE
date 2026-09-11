@@ -10,3 +10,4 @@ pymysql
 cryptography
 bcrypt
 passlib
+httpx

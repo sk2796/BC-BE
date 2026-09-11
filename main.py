@@ -106,10 +106,21 @@ def send_reset_email(to_email: str, recipient_name: str, reset_link: str) -> boo
 
 try:
     from backend.database import engine, Base, get_db
-    from backend.models import ProductModel, PincodeModel, OrderModel, CustomerModel, AdminUserModel
+    from backend.models import ProductModel, PincodeModel, OrderModel, CustomerModel, AdminUserModel, DeliveryModel
+    from backend.services.shipping import (
+        get_shipping_provider, get_available_providers, get_pickup_address,
+        Address, DELIVERY_TO_ORDER_STATUS
+    )
 except ImportError:
     from database import engine, Base, get_db
-    from models import ProductModel, PincodeModel, OrderModel, CustomerModel, AdminUserModel
+    from models import ProductModel, PincodeModel, OrderModel, CustomerModel, AdminUserModel, DeliveryModel
+    from services.shipping import (
+        get_shipping_provider, get_available_providers, get_pickup_address,
+        Address, DELIVERY_TO_ORDER_STATUS
+    )
+
+import json
+import asyncio
 
 # Load credentials from .env configurations file
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"))
@@ -213,7 +224,15 @@ class OrderSubmission(BaseModel):
     status: Optional[str] = "order_confirmed"
 
 class OrderStatusUpdate(BaseModel):
-    status: str  # order_confirmed, shipped, delivered, cancelled
+    status: str  # order_confirmed, dispatched, shipped, delivered, cancelled
+
+
+class DeliveryDispatchRequest(BaseModel):
+    provider: str = "manual"  # borzo, porter, manual
+    package_description: Optional[str] = None
+
+class DeliveryQuoteRequest(BaseModel):
+    provider: str = "manual"
 
 
 class CreateOrderRequest(BaseModel):
@@ -1056,8 +1075,8 @@ def get_customer_orders(customer_id: str, db: Session = Depends(get_db)):
 
 @app.patch("/orders/{order_id}/status")
 def update_order_status(order_id: str, req: OrderStatusUpdate, db: Session = Depends(get_db)):
-    """Update order status (e.g. order_confirmed, shipped, delivered, cancelled)."""
-    valid_statuses = ["order_confirmed", "shipped", "delivered", "cancelled"]
+    """Update order status (e.g. order_confirmed, dispatched, shipped, delivered, cancelled)."""
+    valid_statuses = ["order_confirmed", "dispatched", "shipped", "delivered", "cancelled"]
     normalized_status = req.status.strip().lower().replace(" ", "_")
     if normalized_status not in valid_statuses:
         raise HTTPException(status_code=400, detail=f"Invalid status. Allowed values: {valid_statuses}")
@@ -1080,6 +1099,342 @@ def update_order_status(order_id: str, req: OrderStatusUpdate, db: Session = Dep
         db.rollback()
         print(f"Error updating order status: {e}")
         raise HTTPException(status_code=500, detail="Failed to update order status.")
+
+
+# ============================================================================
+# Delivery / Shipping Endpoints
+# ============================================================================
+
+@app.get("/admin/shipping/providers")
+def list_shipping_providers():
+    """List all available shipping providers and their configuration status."""
+    return get_available_providers()
+
+
+@app.post("/admin/orders/{order_id}/delivery-quote")
+async def get_delivery_quote(order_id: str, req: DeliveryQuoteRequest, db: Session = Depends(get_db)):
+    """Get a delivery price quote from a shipping provider for an order."""
+    order = db.query(OrderModel).filter(OrderModel.order_id == order_id.strip()).first()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found.")
+
+    try:
+        provider = get_shipping_provider(req.provider)
+        pickup = get_pickup_address()
+        delivery_addr = Address(
+            address_line=order.addressLine1 or "",
+            city=order.city or "",
+            pincode=order.pincode or "",
+            landmark=order.landmark,
+            contact_name=order.name,
+            contact_phone=order.phone,
+        )
+
+        quote = await provider.get_quote(pickup, delivery_addr, f"Cake order {order_id}")
+        return {
+            "provider": quote.provider,
+            "estimated_price": quote.estimated_price,
+            "currency": quote.currency,
+            "estimated_duration_minutes": quote.estimated_duration_minutes,
+            "vehicle_type": quote.vehicle_type,
+        }
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        print(f"Error getting delivery quote: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to get delivery quote: {str(e)}")
+
+
+@app.post("/admin/orders/{order_id}/dispatch")
+async def dispatch_delivery(order_id: str, req: DeliveryDispatchRequest, db: Session = Depends(get_db)):
+    """Create a delivery dispatch with the selected shipping provider."""
+    order = db.query(OrderModel).filter(OrderModel.order_id == order_id.strip()).first()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found.")
+
+    # Check if delivery already exists for this order
+    existing_delivery = db.query(DeliveryModel).filter(
+        DeliveryModel.order_id == order_id.strip(),
+        DeliveryModel.status.notin_(["cancelled", "failed"])
+    ).first()
+    if existing_delivery:
+        raise HTTPException(status_code=400, detail=f"Active delivery already exists for this order (ID: {existing_delivery.delivery_id}, Status: {existing_delivery.status})")
+
+    try:
+        provider = get_shipping_provider(req.provider)
+        pickup = get_pickup_address()
+        delivery_addr = Address(
+            address_line=order.addressLine1 or "",
+            city=order.city or "",
+            pincode=order.pincode or "",
+            landmark=order.landmark,
+            contact_name=order.name,
+            contact_phone=order.phone,
+        )
+
+        result = await provider.create_delivery(
+            pickup=pickup,
+            delivery=delivery_addr,
+            order_id=order_id,
+            package_description=req.package_description or f"BloomCakes order {order_id}",
+            package_value=float(order.totalAmount or 0),
+        )
+
+        # Generate delivery ID
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        delivery_id = f"BC-DLV-{order_id.replace('BC-ORD-', '')}-{datetime.now().strftime('%H%M%S')}"
+
+        pickup_str = f"{pickup.address_line}, {pickup.city}, {pickup.pincode}"
+        delivery_str = f"{delivery_addr.address_line}, {delivery_addr.city}, {delivery_addr.pincode}"
+
+        new_delivery = DeliveryModel(
+            delivery_id=delivery_id,
+            order_id=order_id,
+            provider=result.provider,
+            provider_order_id=result.provider_order_id,
+            pickup_address=pickup_str,
+            delivery_address=delivery_str,
+            delivery_fee=result.estimated_price,
+            currency=result.currency,
+            tracking_url=result.tracking_url,
+            rider_name=result.rider_name,
+            rider_phone=result.rider_phone,
+            status=result.status,
+            provider_status_raw=json.dumps(result.raw_response) if result.raw_response else None,
+            created_at=now_str,
+            updated_at=now_str,
+        )
+        db.add(new_delivery)
+
+        # Update order status to dispatched
+        mapped_order_status = DELIVERY_TO_ORDER_STATUS.get(result.status, "dispatched")
+        if order.status in ("order_confirmed", "dispatched"):
+            order.status = mapped_order_status
+
+        db.commit()
+        db.refresh(new_delivery)
+
+        print(f"Delivery dispatched: {delivery_id} via {result.provider} for order {order_id}")
+
+        return {
+            "status": "success",
+            "delivery_id": delivery_id,
+            "provider": result.provider,
+            "provider_order_id": result.provider_order_id,
+            "delivery_status": result.status,
+            "estimated_price": result.estimated_price,
+            "tracking_url": result.tracking_url,
+            "rider_name": result.rider_name,
+            "rider_phone": result.rider_phone,
+            "order_status": order.status,
+            "message": f"Delivery dispatched successfully via {result.provider}"
+        }
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        db.rollback()
+        print(f"Error dispatching delivery: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to dispatch delivery: {str(e)}")
+
+
+@app.get("/admin/orders/{order_id}/delivery")
+async def get_delivery_info(order_id: str, db: Session = Depends(get_db)):
+    """Get delivery information for an order, including live status from provider."""
+    delivery = db.query(DeliveryModel).filter(
+        DeliveryModel.order_id == order_id.strip()
+    ).order_by(DeliveryModel.id.desc()).first()
+
+    if not delivery:
+        return {"has_delivery": False, "delivery": None}
+
+    # If delivery is active, try to get live status from provider
+    live_status = None
+    if delivery.status not in ("delivered", "cancelled", "failed") and delivery.provider != "manual":
+        try:
+            provider = get_shipping_provider(delivery.provider)
+            if delivery.provider_order_id:
+                live_status = await provider.get_delivery_status(delivery.provider_order_id)
+                # Update local DB with latest status
+                if live_status:
+                    delivery.status = live_status.status
+                    delivery.rider_name = live_status.rider_name or delivery.rider_name
+                    delivery.rider_phone = live_status.rider_phone or delivery.rider_phone
+                    delivery.updated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    delivery.provider_status_raw = json.dumps(live_status.raw_response) if live_status.raw_response else delivery.provider_status_raw
+                    db.commit()
+                    db.refresh(delivery)
+        except Exception as e:
+            print(f"Could not fetch live status for delivery {delivery.delivery_id}: {e}")
+
+    return {
+        "has_delivery": True,
+        "delivery": {
+            "delivery_id": delivery.delivery_id,
+            "order_id": delivery.order_id,
+            "provider": delivery.provider,
+            "provider_order_id": delivery.provider_order_id,
+            "pickup_address": delivery.pickup_address,
+            "delivery_address": delivery.delivery_address,
+            "delivery_fee": delivery.delivery_fee,
+            "currency": delivery.currency,
+            "tracking_url": delivery.tracking_url,
+            "rider_name": delivery.rider_name,
+            "rider_phone": delivery.rider_phone,
+            "status": delivery.status,
+            "created_at": delivery.created_at,
+            "updated_at": delivery.updated_at,
+        }
+    }
+
+
+@app.post("/admin/orders/{order_id}/cancel-delivery")
+async def cancel_order_delivery(order_id: str, db: Session = Depends(get_db)):
+    """Cancel an active delivery for an order."""
+    delivery = db.query(DeliveryModel).filter(
+        DeliveryModel.order_id == order_id.strip(),
+        DeliveryModel.status.notin_(["delivered", "cancelled", "failed"])
+    ).order_by(DeliveryModel.id.desc()).first()
+
+    if not delivery:
+        raise HTTPException(status_code=404, detail="No active delivery found for this order.")
+
+    try:
+        # Cancel with provider if not manual
+        if delivery.provider != "manual" and delivery.provider_order_id:
+            provider = get_shipping_provider(delivery.provider)
+            success = await provider.cancel_delivery(delivery.provider_order_id)
+            if not success:
+                raise HTTPException(status_code=400, detail="Provider could not cancel this delivery. It may already be picked up.")
+
+        delivery.status = "cancelled"
+        delivery.updated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        # Revert order status if it was dispatched
+        order = db.query(OrderModel).filter(OrderModel.order_id == order_id.strip()).first()
+        if order and order.status in ("dispatched", "shipped"):
+            order.status = "order_confirmed"
+
+        db.commit()
+
+        return {
+            "status": "success",
+            "delivery_id": delivery.delivery_id,
+            "message": "Delivery cancelled successfully"
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        print(f"Error cancelling delivery: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to cancel delivery: {str(e)}")
+
+
+@app.get("/admin/deliveries")
+def get_all_deliveries(db: Session = Depends(get_db)):
+    """Get all delivery records for the admin dashboard."""
+    try:
+        deliveries = db.query(DeliveryModel).order_by(DeliveryModel.id.desc()).all()
+        return [
+            {
+                "delivery_id": d.delivery_id,
+                "order_id": d.order_id,
+                "provider": d.provider,
+                "provider_order_id": d.provider_order_id,
+                "pickup_address": d.pickup_address,
+                "delivery_address": d.delivery_address,
+                "delivery_fee": d.delivery_fee,
+                "tracking_url": d.tracking_url,
+                "rider_name": d.rider_name,
+                "rider_phone": d.rider_phone,
+                "status": d.status,
+                "created_at": d.created_at,
+                "updated_at": d.updated_at,
+            }
+            for d in deliveries
+        ]
+    except Exception as e:
+        print(f"Error fetching deliveries: {e}")
+        return []
+
+
+@app.post("/webhooks/delivery/{provider_name}")
+async def delivery_webhook(provider_name: str, payload: dict, db: Session = Depends(get_db)):
+    """Receive real-time delivery status updates from shipping providers via webhook."""
+    try:
+        provider = get_shipping_provider(provider_name)
+        status_update = provider.parse_webhook(payload)
+
+        if not status_update or not status_update.provider_order_id:
+            return {"status": "ignored", "message": "Could not parse webhook payload"}
+
+        # Find the delivery record
+        delivery = db.query(DeliveryModel).filter(
+            DeliveryModel.provider_order_id == status_update.provider_order_id
+        ).first()
+
+        if not delivery:
+            print(f"Webhook: No delivery found for provider order {status_update.provider_order_id}")
+            return {"status": "not_found"}
+
+        # Update delivery status
+        delivery.status = status_update.status
+        delivery.rider_name = status_update.rider_name or delivery.rider_name
+        delivery.rider_phone = status_update.rider_phone or delivery.rider_phone
+        delivery.updated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        delivery.provider_status_raw = json.dumps(status_update.raw_response) if status_update.raw_response else delivery.provider_status_raw
+
+        # Auto-update order status based on delivery status
+        order = db.query(OrderModel).filter(OrderModel.order_id == delivery.order_id).first()
+        if order:
+            new_order_status = DELIVERY_TO_ORDER_STATUS.get(status_update.status)
+            if new_order_status and order.status != "cancelled":
+                order.status = new_order_status
+
+        db.commit()
+
+        print(f"Webhook: Updated delivery {delivery.delivery_id} to status '{status_update.status}'")
+        return {"status": "success", "delivery_id": delivery.delivery_id, "new_status": status_update.status}
+
+    except Exception as e:
+        db.rollback()
+        print(f"Webhook processing error: {e}")
+        return {"status": "error", "message": str(e)}
+
+
+@app.patch("/admin/deliveries/{delivery_id}/status")
+def update_delivery_status_manual(delivery_id: str, req: OrderStatusUpdate, db: Session = Depends(get_db)):
+    """Manually update a delivery status (mainly for manual/self deliveries)."""
+    valid_statuses = ["pending", "accepted", "rider_assigned", "picked_up", "in_transit", "delivered", "cancelled", "failed"]
+    normalized = req.status.strip().lower().replace(" ", "_")
+    if normalized not in valid_statuses:
+        raise HTTPException(status_code=400, detail=f"Invalid delivery status. Allowed: {valid_statuses}")
+
+    delivery = db.query(DeliveryModel).filter(DeliveryModel.delivery_id == delivery_id.strip()).first()
+    if not delivery:
+        raise HTTPException(status_code=404, detail="Delivery not found.")
+
+    try:
+        delivery.status = normalized
+        delivery.updated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        # Auto-update order status
+        order = db.query(OrderModel).filter(OrderModel.order_id == delivery.order_id).first()
+        if order:
+            new_order_status = DELIVERY_TO_ORDER_STATUS.get(normalized)
+            if new_order_status and order.status != "cancelled":
+                order.status = new_order_status
+
+        db.commit()
+        return {
+            "status": "success",
+            "delivery_id": delivery.delivery_id,
+            "new_status": delivery.status,
+            "message": f"Delivery status updated to '{normalized}'"
+        }
+    except Exception as e:
+        db.rollback()
+        print(f"Error updating delivery status: {e}")
+        raise HTTPException(status_code=500, detail="Failed to update delivery status.")
 
 
 

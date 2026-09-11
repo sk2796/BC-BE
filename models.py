@@ -78,3 +78,23 @@ class AdminUserModel(Base):
     is_active = Column(Boolean, default=True)
     created_at = Column(String(50), default=lambda: datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
     updated_at = Column(String(50), default=lambda: datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+
+class DeliveryModel(Base):
+    __tablename__ = "deliveries"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    delivery_id = Column(String(100), index=True, nullable=False, unique=True)
+    order_id = Column(String(100), index=True, nullable=False)
+    provider = Column(String(50), nullable=False)                     # "borzo", "porter", "manual"
+    provider_order_id = Column(String(200), nullable=True)            # external tracking ID from provider
+    pickup_address = Column(Text, nullable=False)
+    delivery_address = Column(Text, nullable=False)
+    delivery_fee = Column(Float, default=0.0)
+    currency = Column(String(10), default="INR")
+    tracking_url = Column(Text, nullable=True)
+    rider_name = Column(String(255), nullable=True)
+    rider_phone = Column(String(20), nullable=True)
+    status = Column(String(50), default="pending")                    # pending, accepted, rider_assigned, picked_up, in_transit, delivered, cancelled, failed
+    provider_status_raw = Column(Text, nullable=True)                 # raw JSON from provider
+    created_at = Column(String(50), default=lambda: datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    updated_at = Column(String(50), default=lambda: datetime.now().strftime("%Y-%m-%d %H:%M:%S"))

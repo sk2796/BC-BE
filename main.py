@@ -276,7 +276,27 @@ class OrderSubmission(BaseModel):
     class Config:
         extra = "forbid"
 
+class CustomCakeRequest(BaseModel):
+    customerName: str = Field(..., min_length=2, max_length=100, pattern=r"^[a-zA-Z\s]+$")
+    customerPhone: str = Field(..., pattern=r"^\d{10}$")
+    customerEmail: Optional[str] = Field(default=None, pattern=r"^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$", max_length=255)
+    occasion: str = Field(..., min_length=2, max_length=50)
+    occasionNotes: Optional[str] = Field(default=None, max_length=500, pattern=r"^[^<>]*$")
+    flavor: str = Field(..., min_length=2, max_length=100)
+    size: str = Field(..., min_length=1, max_length=50)
+    shape: str = Field(..., min_length=2, max_length=50)
+    customMessage: Optional[str] = Field(default=None, max_length=255, pattern=r"^[^<>]*$")
+    specialInstructions: Optional[str] = Field(default=None, max_length=1000, pattern=r"^[^<>]*$")
+    deliveryDate: Optional[str] = Field(default=None, max_length=20)
+    deliveryTimeSlot: str = Field(..., min_length=3, max_length=50)
+    pincode: str = Field(..., pattern=r"^\d{6}$")
+    deliveryAddress: str = Field(..., min_length=5, max_length=500, pattern=r"^[^<>]*$")
+
+    class Config:
+        extra = "forbid"
+
 class OrderStatusUpdate(BaseModel):
+
     status: str = Field(..., pattern=r"^(order_confirmed|dispatched|shipped|delivered|cancelled)$")
 
     class Config:
@@ -878,6 +898,112 @@ def submit_order(order: OrderSubmission, db: Session = Depends(get_db)):
         "order_status": new_order.status,
         "message": "Order processed and stored successfully"
     }
+
+@app.post("/api/custom-cakes", dependencies=[Depends(loose_limiter)])
+def submit_custom_cake_order(req: CustomCakeRequest, db: Session = Depends(get_db)):
+    """Save custom cake design request as an Order in MySQL and dispatch notification."""
+    clean_phone = clean_phone_to_10_digits(req.customerPhone)
+    phone_suffix = clean_phone[-4:] if len(clean_phone) >= 4 else "0000"
+    today_str = datetime.now().strftime("%Y%m%d")
+    order_id = f"BC-CSTK-{phone_suffix}-{today_str}"
+
+    items_summary = f"Custom Cake ({req.flavor}, {req.size}, {req.shape}) | Instructions: {req.specialInstructions or 'None'}"
+
+    # Match or auto-create customer record
+    existing_cust = db.query(CustomerModel).filter(CustomerModel.phone == clean_phone).first()
+    if existing_cust:
+        matched_cust_id = existing_cust.customer_id
+    else:
+        name_clean = "".join(filter(str.isalpha, req.customerName)).upper()
+        name_prefix = name_clean[:3] if len(name_clean) >= 3 else "CST"
+        matched_cust_id = f"BC-CUST-{name_prefix}-{phone_suffix}"
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            new_cust = CustomerModel(
+                customer_id=matched_cust_id,
+                name=req.customerName,
+                phone=clean_phone,
+                email=req.customerEmail or None,
+                city="Ahmedabad",
+                pincode=req.pincode,
+                created_at=now_str,
+                updated_at=now_str
+            )
+            db.add(new_cust)
+            db.commit()
+        except Exception as ex:
+            db.rollback()
+            print(f"Customer auto-creation note: {ex}")
+
+    try:
+        new_order = OrderModel(
+            order_id=order_id,
+            customer_id=matched_cust_id,
+            name=req.customerName,
+            phone=clean_phone,
+            email=req.customerEmail or None,
+            addressLine1=req.deliveryAddress,
+            landmark=None,
+            city="Ahmedabad",
+            pincode=req.pincode,
+            date=req.deliveryDate or datetime.now().strftime("%Y-%m-%d"),
+            timeSlot=req.deliveryTimeSlot,
+            occasion=f"Custom: {req.occasion.upper()}",
+            customOccasion=req.occasionNotes or None,
+            items_summary=items_summary,
+            activePromo="CUSTOM_QUOTE",
+            discountAmount=0,
+            totalAmount=0,
+            status="order_confirmed",
+            created_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        )
+        db.add(new_order)
+        db.commit()
+        db.refresh(new_order)
+        print(f"Saved Custom Cake Order {order_id} to DB.")
+    except Exception as e:
+        db.rollback()
+        print(f"Error saving Custom Cake Order to DB: {e}")
+        raise HTTPException(status_code=500, detail="Failed to record custom cake order in database.")
+
+    # Dispatch email notification to bakery admin
+    if SMTP_PASSWORD:
+        try:
+            admin_email = "chhotelalpeda@gmail.com"
+            subject = f"✨ New Custom Cake Request #{order_id} - {req.customerName}"
+            html_body = f"""
+            <h2>🎂 New Custom Cake Order Details #{order_id}</h2>
+            <p><strong>Customer:</strong> {req.customerName} ({req.customerPhone})</p>
+            <p><strong>Email:</strong> {req.customerEmail or 'Not provided'}</p>
+            <p><strong>Occasion:</strong> {req.occasion.upper()} - {req.occasionNotes or 'N/A'}</p>
+            <p><strong>Flavour:</strong> {req.flavor} | <strong>Size:</strong> {req.size} | <strong>Shape:</strong> {req.shape}</p>
+            <p><strong>Message on Cake:</strong> {req.customMessage or 'None'}</p>
+            <p><strong>Special Instructions:</strong> {req.specialInstructions or 'None'}</p>
+            <p><strong>Delivery Date & Slot:</strong> {req.deliveryDate or 'Asap'} ({req.deliveryTimeSlot})</p>
+            <p><strong>Delivery Address:</strong> {req.deliveryAddress} - {req.pincode}</p>
+            """
+            msg = MIMEMultipart("alternative")
+            msg["Subject"] = subject
+            msg["From"] = f"BloomCakes <{SMTP_USER}>"
+            msg["To"] = admin_email
+            msg.attach(MIMEText(html_body, "html"))
+
+            server = smtplib.SMTP(SMTP_HOST, SMTP_PORT)
+            server.starttls()
+            server.login(SMTP_USER, SMTP_PASSWORD)
+            server.sendmail(SMTP_USER, admin_email, msg.as_string())
+            server.quit()
+            print(f"Custom cake notification email sent to {admin_email}")
+        except Exception as mail_err:
+            print(f"Custom cake email notification warning: {mail_err}")
+
+    return {
+        "status": "success",
+        "order_id": order_id,
+        "customer_id": matched_cust_id,
+        "message": "Custom cake request saved and notification sent successfully."
+    }
+
 
 @app.post("/customers")
 def save_customer(customer: CustomerDetails, db: Session = Depends(get_db)):

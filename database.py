@@ -5,10 +5,9 @@ from sqlalchemy.orm import declarative_base, sessionmaker
 
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"))
 
-DATABASE_URL = os.getenv(
-    "DATABASE_URL",
-    "mysql+pymysql://u_hPcMes:CnJtnSaxc6Uz@sql.freedb.tech:3306/freedb_Sh0rGH8z"
-)
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    raise ValueError("DATABASE_URL environment variable is not set. Please configure it in your deployment environment.")
 
 from sqlalchemy.pool import NullPool
 

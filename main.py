@@ -7,9 +7,14 @@ import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime, timedelta
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, Request, UploadFile, File
+from fastapi.responses import JSONResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from sqlalchemy.exc import SQLAlchemyError
+import logging
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+from pydantic import BaseModel, Field
 from typing import List, Optional
 from sqlalchemy.orm import Session
 import razorpay
@@ -32,7 +37,9 @@ load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"))
 
 SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
-SMTP_USER = os.getenv("SMTP_USER", "chhotelalpeda@gmail.com")
+SMTP_USER = os.getenv("SMTP_USER")
+if not SMTP_USER:
+    print("Warning: SMTP_USER not set. Email functionality may not work.")
 SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
 FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173")
 
@@ -119,6 +126,11 @@ except ImportError:
         Address, DELIVERY_TO_ORDER_STATUS
     )
 
+try:
+    from backend.rate_limiter import limiter, strict_limiter, moderate_limiter, loose_limiter
+except ImportError:
+    from rate_limiter import limiter, strict_limiter, moderate_limiter, loose_limiter
+
 import json
 import asyncio
 
@@ -151,6 +163,32 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+@app.exception_handler(SQLAlchemyError)
+async def sqlalchemy_exception_handler(request: Request, exc: SQLAlchemyError):
+    req_id = secrets.token_hex(8)
+    logging.error(f"[Req {req_id}] Database Exception: {exc}", exc_info=True)
+    return JSONResponse(
+        status_code=500,
+        content={
+            "detail": "A database error occurred. Please try again later.",
+            "request_id": req_id
+        },
+        headers={"X-Request-ID": req_id}
+    )
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    req_id = secrets.token_hex(8)
+    logging.error(f"[Req {req_id}] Unhandled Exception: {exc}", exc_info=True)
+    return JSONResponse(
+        status_code=500,
+        content={
+            "detail": "An unexpected internal server error occurred. Please try again later.",
+            "request_id": req_id
+        },
+        headers={"X-Request-ID": req_id}
+    )
+
 # Pydantic models for validation and responses
 class CakeItem(BaseModel):
     id: str
@@ -167,27 +205,36 @@ class CakeItem(BaseModel):
         from_attributes = True
 
 class ProductCreateRequest(BaseModel):
-    name: str
-    category: str
-    price: int
-    description: Optional[str] = None
-    imageUrl: str
+    name: str = Field(..., min_length=2, max_length=100, pattern=r"^[^<>]*$")
+    category: str = Field(..., min_length=2, max_length=50, pattern=r"^[a-zA-Z\s]+$")
+    price: int = Field(..., gt=0)
+    description: Optional[str] = Field(default=None, max_length=1000, pattern=r"^[^<>]*$")
+    imageUrl: str = Field(..., pattern=r"^https?://")
     isBestseller: Optional[bool] = False
-    rating: Optional[float] = 4.8
+    rating: Optional[float] = Field(default=4.8, ge=0.0, le=5.0)
+
+    class Config:
+        extra = "forbid"
 
 class ProductUpdateRequest(BaseModel):
-    name: Optional[str] = None
-    category: Optional[str] = None
-    price: Optional[int] = None
-    description: Optional[str] = None
-    imageUrl: Optional[str] = None
+    name: Optional[str] = Field(default=None, min_length=2, max_length=100, pattern=r"^[^<>]*$")
+    category: Optional[str] = Field(default=None, min_length=2, max_length=50, pattern=r"^[a-zA-Z\s]+$")
+    price: Optional[int] = Field(default=None, gt=0)
+    description: Optional[str] = Field(default=None, max_length=1000, pattern=r"^[^<>]*$")
+    imageUrl: Optional[str] = Field(default=None, pattern=r"^https?://")
     isBestseller: Optional[bool] = None
-    rating: Optional[float] = None
+    rating: Optional[float] = Field(default=None, ge=0.0, le=5.0)
+
+    class Config:
+        extra = "forbid"
 
 class PincodeCreateRequest(BaseModel):
-    pincode: str
-    city: str
-    state: str
+    pincode: str = Field(..., pattern=r"^\d{6}$")
+    city: str = Field(..., min_length=2, max_length=50, pattern=r"^[a-zA-Z\s]+$")
+    state: str = Field(..., min_length=2, max_length=50, pattern=r"^[a-zA-Z\s]+$")
+
+    class Config:
+        extra = "forbid"
 
 class PincodeItem(BaseModel):
     pincode: str
@@ -198,95 +245,139 @@ class PincodeItem(BaseModel):
         from_attributes = True
 
 class OrderSummaryItem(BaseModel):
-    cakeId: str
-    name: str
-    weight: str
-    price: int
-    quantity: int
+    cakeId: str = Field(..., min_length=1, max_length=50)
+    name: str = Field(..., min_length=2, max_length=100)
+    weight: str = Field(..., min_length=1, max_length=20)
+    price: int = Field(..., ge=0)
+    quantity: int = Field(..., gt=0)
+
+    class Config:
+        extra = "forbid"
 
 class OrderSubmission(BaseModel):
-    name: str
-    phone: str
-    email: Optional[str] = None
-    customer_id: Optional[str] = None
-    addressLine1: str
-    landmark: Optional[str] = None
-    city: str
-    pincode: str
-    date: str
-    timeSlot: str
-    occasion: str
-    customOccasion: Optional[str] = None
-    items: List[OrderSummaryItem]
-    activePromo: Optional[str] = None
-    discountAmount: int = 0
-    totalAmount: int
-    status: Optional[str] = "order_confirmed"
+    name: str = Field(..., min_length=2, max_length=100, pattern=r"^[a-zA-Z\s]+$")
+    phone: str = Field(..., pattern=r"^\d{10}$")
+    email: Optional[str] = Field(default=None, pattern=r"^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$", max_length=255)
+    customer_id: Optional[str] = Field(default=None, max_length=50)
+    addressLine1: str = Field(..., min_length=5, max_length=255, pattern=r"^[^<>]*$")
+    landmark: Optional[str] = Field(default=None, max_length=100, pattern=r"^[^<>]*$")
+    city: str = Field(..., min_length=2, max_length=50, pattern=r"^[a-zA-Z\s]+$")
+    pincode: str = Field(..., pattern=r"^\d{6}$")
+    date: str = Field(..., pattern=r"^\d{4}-\d{2}-\d{2}$")
+    timeSlot: str = Field(..., min_length=3, max_length=50)
+    occasion: str = Field(..., min_length=2, max_length=50)
+    customOccasion: Optional[str] = Field(default=None, max_length=100)
+    items: List[OrderSummaryItem] = Field(..., min_items=1)
+    activePromo: Optional[str] = Field(default=None, max_length=20)
+    discountAmount: int = Field(default=0, ge=0)
+    totalAmount: int = Field(..., ge=0)
+    status: Optional[str] = Field(default="order_confirmed", max_length=50)
+
+    class Config:
+        extra = "forbid"
 
 class OrderStatusUpdate(BaseModel):
-    status: str  # order_confirmed, dispatched, shipped, delivered, cancelled
+    status: str = Field(..., pattern=r"^(order_confirmed|dispatched|shipped|delivered|cancelled)$")
 
+    class Config:
+        extra = "forbid"
 
 class DeliveryDispatchRequest(BaseModel):
-    provider: str = "manual"  # borzo, porter, manual
-    package_description: Optional[str] = None
+    provider: str = Field(default="manual", pattern=r"^(borzo|porter|manual)$")
+    package_description: Optional[str] = Field(default=None, max_length=255)
+
+    class Config:
+        extra = "forbid"
 
 class DeliveryQuoteRequest(BaseModel):
-    provider: str = "manual"
+    provider: str = Field(default="manual", pattern=r"^(borzo|porter|manual)$")
+
+    class Config:
+        extra = "forbid"
 
 
 class CreateOrderRequest(BaseModel):
-    amount: int  # in paise
-    currency: str = "INR"
-    receipt: Optional[str] = None
+    amount: int = Field(..., gt=0)  # in paise
+    currency: str = Field(default="INR", pattern=r"^[A-Z]{3}$")
+    receipt: Optional[str] = Field(default=None, max_length=50)
+
+    class Config:
+        extra = "forbid"
 
 class VerifyPaymentRequest(BaseModel):
-    razorpay_order_id: str
-    razorpay_payment_id: str
-    razorpay_signature: str
+    razorpay_order_id: str = Field(..., min_length=5, max_length=100)
+    razorpay_payment_id: str = Field(..., min_length=5, max_length=100)
+    razorpay_signature: str = Field(..., min_length=10, max_length=255)
+
+    class Config:
+        extra = "forbid"
 
 class CustomerDetails(BaseModel):
-    name: str
-    phone: str
-    email: Optional[str] = None
-    password: Optional[str] = None
-    city: Optional[str] = None
-    state: Optional[str] = None
-    pincode: Optional[str] = None
+    name: str = Field(..., min_length=2, max_length=100, pattern=r"^[a-zA-Z\s]+$")
+    phone: str = Field(..., pattern=r"^\d{10}$")
+    email: Optional[str] = Field(default=None, pattern=r"^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$", max_length=255)
+    password: Optional[str] = Field(default=None, min_length=6, max_length=128)
+    city: Optional[str] = Field(default=None, min_length=2, max_length=50, pattern=r"^[a-zA-Z\s]+$")
+    state: Optional[str] = Field(default=None, min_length=2, max_length=50, pattern=r"^[a-zA-Z\s]+$")
+    pincode: Optional[str] = Field(default=None, pattern=r"^\d{6}$")
+
+    class Config:
+        extra = "forbid"
 
 class CustomerRegisterRequest(BaseModel):
-    name: str
-    phone: str
-    email: Optional[str] = None
-    password: str
+    name: str = Field(..., min_length=2, max_length=100, pattern=r"^[a-zA-Z\s]+$")
+    phone: str = Field(..., pattern=r"^\d{10}$")
+    email: Optional[str] = Field(default=None, pattern=r"^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$", max_length=255)
+    password: str = Field(..., min_length=6, max_length=128)
+
+    class Config:
+        extra = "forbid"
 
 class CustomerLoginRequest(BaseModel):
-    identifier: str  # Email or 10-digit phone number
-    password: str
+    identifier: str = Field(..., min_length=5, max_length=255)  # Email or 10-digit phone number
+    password: str = Field(..., min_length=6, max_length=128)
+
+    class Config:
+        extra = "forbid"
 
 class ForgotPasswordRequest(BaseModel):
-    identifier: str  # Email or 10-digit phone number
+    identifier: str = Field(..., min_length=5, max_length=255)  # Email or 10-digit phone number
+
+    class Config:
+        extra = "forbid"
 
 class ResetPasswordRequest(BaseModel):
-    token: str
-    new_password: str
+    token: str = Field(..., min_length=10, max_length=255)
+    new_password: str = Field(..., min_length=6, max_length=128)
+
+    class Config:
+        extra = "forbid"
 
 class AdminLoginRequest(BaseModel):
-    email: str
-    password: str
+    email: str = Field(..., pattern=r"^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$", max_length=255)
+    password: str = Field(..., min_length=6, max_length=128)
+
+    class Config:
+        extra = "forbid"
 
 class AdminUserCreateRequest(BaseModel):
-    name: str
-    email: str
-    password: str
-    role: str = "manager"  # super_admin, manager, delivery_staff, catalog_editor
+    name: str = Field(..., min_length=2, max_length=100, pattern=r"^[a-zA-Z\s]+$")
+    email: str = Field(..., pattern=r"^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$", max_length=255)
+    password: str = Field(..., min_length=8, max_length=128)
+    role: str = Field(default="manager", pattern=r"^(super_admin|manager|delivery_staff|catalog_editor)$")
     is_active: bool = True
 
+    class Config:
+        extra = "forbid"
+
 class AdminUserUpdateRequest(BaseModel):
-    name: Optional[str] = None
-    role: Optional[str] = None
+    name: Optional[str] = Field(default=None, min_length=2, max_length=100, pattern=r"^[a-zA-Z\s]+$")
+    role: Optional[str] = Field(default=None, pattern=r"^(super_admin|manager|delivery_staff|catalog_editor)$")
     is_active: Optional[bool] = None
-    password: Optional[str] = None
+    password: Optional[str] = Field(default=None, min_length=8, max_length=128)
+
+    class Config:
+        extra = "forbid"
 
 
 def clean_phone_to_10_digits(phone: str) -> str:
@@ -300,7 +391,7 @@ def clean_phone_to_10_digits(phone: str) -> str:
 
 # Endpoints
 
-@app.get("/")
+@app.get("/", dependencies=[Depends(moderate_limiter)])
 def read_root():
     return {"message": "Welcome to BloomCakes Backend API. Visit /docs for Swagger specifications documentation."}
 
@@ -309,7 +400,7 @@ def read_root():
 def health_check():
     return {"status": "healthy"}
 
-@app.get("/products", response_model=List[CakeItem])
+@app.get("/products", dependencies=[Depends(moderate_limiter)], response_model=List[CakeItem])
 def get_products(db: Session = Depends(get_db)):
     """Retrieve all cake catalog items from MySQL Database."""
     products = db.query(ProductModel).all()
@@ -317,7 +408,7 @@ def get_products(db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="No products found in database.")
     return products
 
-@app.get("/products/{slug}", response_model=CakeItem)
+@app.get("/products/{slug}", dependencies=[Depends(moderate_limiter)], response_model=CakeItem)
 def get_product_by_slug(slug: str, db: Session = Depends(get_db)):
     """Retrieve a single cake product matched by its unique slug from MySQL Database."""
     product = db.query(ProductModel).filter(ProductModel.slug == slug).first()
@@ -325,7 +416,7 @@ def get_product_by_slug(slug: str, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Product not found.")
     return product
 
-@app.get("/pincodes")
+@app.get("/pincodes", dependencies=[Depends(moderate_limiter)])
 def check_pincode(code: str, db: Session = Depends(get_db)):
     """Check if a specific pincode is serviceable in MySQL Database."""
     item = db.query(PincodeModel).filter(PincodeModel.pincode == code.strip()).first()
@@ -379,7 +470,7 @@ def generate_product_id(name: str, category: str, db: Session) -> str:
         candidate_id = f"{base_id}-{counter}"
     return candidate_id
 
-@app.get("/admin/analytics")
+@app.get("/admin/analytics", dependencies=[Depends(loose_limiter)])
 def get_admin_analytics(db: Session = Depends(get_db)):
     """Summary analytics for SaaS Admin Portal."""
     try:
@@ -432,16 +523,24 @@ def get_admin_analytics(db: Session = Depends(get_db)):
         }
 
 @app.post("/admin/auth/login")
-def admin_login(payload: AdminLoginRequest, db: Session = Depends(get_db)):
+def admin_login(payload: AdminLoginRequest, request: Request, db: Session = Depends(get_db)):
     """Authenticate admin or staff user and return their role and permissions."""
     email_clean = payload.email.strip().lower()
+    
+    limiter.check_strict(request, email_clean)
+    
     user = db.query(AdminUserModel).filter(AdminUserModel.email == email_clean).first()
     if not user:
+        limiter.report_auth_failure(request, email_clean)
         raise HTTPException(status_code=401, detail="Invalid admin credentials.")
     if not user.is_active:
+        limiter.report_auth_failure(request, email_clean)
         raise HTTPException(status_code=403, detail="Your staff account has been deactivated. Contact Super Admin.")
     if not verify_password(payload.password, user.password_hash):
+        limiter.report_auth_failure(request, email_clean)
         raise HTTPException(status_code=401, detail="Invalid admin credentials.")
+        
+    limiter.report_auth_success(request, email_clean)
         
     return {
         "success": True,
@@ -455,7 +554,7 @@ def admin_login(payload: AdminLoginRequest, db: Session = Depends(get_db)):
         "token": f"adm_sec_{user.admin_id}_{secrets.token_hex(16)}"
     }
 
-@app.get("/admin/users")
+@app.get("/admin/users", dependencies=[Depends(loose_limiter)])
 def get_all_admin_users(db: Session = Depends(get_db)):
     """Retrieve all staff accounts with their roles and status."""
     users = db.query(AdminUserModel).order_by(AdminUserModel.id.asc()).all()
@@ -557,7 +656,7 @@ def delete_admin_user(admin_id: str, db: Session = Depends(get_db)):
     db.commit()
     return {"success": True, "message": f"Staff user {admin_id} deleted."}
 
-@app.post("/admin/products", response_model=CakeItem)
+@app.post("/admin/products", response_model=CakeItem, dependencies=[Depends(loose_limiter)])
 def create_product(payload: ProductCreateRequest, db: Session = Depends(get_db)):
     """Create a new product with auto-generated meaningful ID and URL slug."""
     new_id = generate_product_id(payload.name, payload.category, db)
@@ -580,7 +679,7 @@ def create_product(payload: ProductCreateRequest, db: Session = Depends(get_db))
     db.refresh(new_prod)
     return new_prod
 
-@app.put("/admin/products/{product_id}", response_model=CakeItem)
+@app.put("/admin/products/{product_id}", response_model=CakeItem, dependencies=[Depends(loose_limiter)])
 def update_product(product_id: str, payload: ProductUpdateRequest, db: Session = Depends(get_db)):
     """Update an existing product's details and dynamically adjust slug if name changed."""
     product = db.query(ProductModel).filter(ProductModel.id == product_id).first()
@@ -608,7 +707,7 @@ def update_product(product_id: str, payload: ProductUpdateRequest, db: Session =
     db.refresh(product)
     return product
 
-@app.delete("/admin/products/{product_id}")
+@app.delete("/admin/products/{product_id}", dependencies=[Depends(loose_limiter)])
 def delete_product(product_id: str, db: Session = Depends(get_db)):
     """Remove a product from the database catalog."""
     product = db.query(ProductModel).filter(ProductModel.id == product_id).first()
@@ -648,7 +747,7 @@ def delete_pincode(code: str, db: Session = Depends(get_db)):
     db.commit()
     return {"success": True, "message": f"Pincode {code} removed."}
 
-@app.get("/admin/orders")
+@app.get("/admin/orders", dependencies=[Depends(loose_limiter)])
 def get_all_orders(db: Session = Depends(get_db)):
     """Retrieve all saved order records from MySQL Database."""
     try:
@@ -681,7 +780,7 @@ def get_all_orders(db: Session = Depends(get_db)):
         print(f"Error reading orders from DB: {e}")
         return []
 
-@app.get("/admin/customers")
+@app.get("/admin/customers", dependencies=[Depends(loose_limiter)])
 def get_all_customers(db: Session = Depends(get_db)):
     """Retrieve all saved customer records from MySQL Database."""
     try:
@@ -703,7 +802,7 @@ def get_all_customers(db: Session = Depends(get_db)):
         print(f"Error reading customers from DB: {e}")
         return []
 
-@app.post("/orders")
+@app.post("/orders", dependencies=[Depends(loose_limiter)])
 def submit_order(order: OrderSubmission, db: Session = Depends(get_db)):
     """Save order record to MySQL Database mapped to customer_id."""
     clean_phone = clean_phone_to_10_digits(order.phone)
@@ -830,22 +929,28 @@ def save_customer(customer: CustomerDetails, db: Session = Depends(get_db)):
         raise HTTPException(status_code=500, detail="Failed to save customer details.")
 
 @app.post("/customers/register")
-def register_customer(req: CustomerRegisterRequest, db: Session = Depends(get_db)):
+def register_customer(req: CustomerRegisterRequest, request: Request, db: Session = Depends(get_db)):
     """Register a new customer with hashed password in the customers table."""
     clean_phone = clean_phone_to_10_digits(req.phone)
+    limiter.check_strict(request, clean_phone)
+    
     if len(clean_phone) != 10:
+        limiter.report_auth_failure(request, clean_phone)
         raise HTTPException(status_code=400, detail="A valid 10-digit phone number is required.")
     
     if len(req.password) < 6:
+        limiter.report_auth_failure(request, clean_phone)
         raise HTTPException(status_code=400, detail="Password must be at least 6 characters.")
 
     existing_phone = db.query(CustomerModel).filter(CustomerModel.phone == clean_phone).first()
     if existing_phone:
+        limiter.report_auth_failure(request, clean_phone)
         raise HTTPException(status_code=400, detail="An account with this phone number already exists.")
 
     if req.email:
         existing_email = db.query(CustomerModel).filter(CustomerModel.email == req.email.strip().lower()).first()
         if existing_email:
+            limiter.report_auth_failure(request, clean_phone)
             raise HTTPException(status_code=400, detail="An account with this email already exists.")
 
     phone_suffix = clean_phone[-4:]
@@ -867,6 +972,8 @@ def register_customer(req: CustomerRegisterRequest, db: Session = Depends(get_db
         db.add(new_customer)
         db.commit()
         db.refresh(new_customer)
+        
+        limiter.report_auth_success(request, clean_phone)
 
         return {
             "status": "success",
@@ -884,9 +991,11 @@ def register_customer(req: CustomerRegisterRequest, db: Session = Depends(get_db
         raise HTTPException(status_code=500, detail="Failed to register customer.")
 
 @app.post("/customers/login")
-def login_customer(req: CustomerLoginRequest, db: Session = Depends(get_db)):
+def login_customer(req: CustomerLoginRequest, request: Request, db: Session = Depends(get_db)):
     """Authenticate customer against the customers table via email or phone."""
     trimmed_id = req.identifier.strip()
+    limiter.check_strict(request, trimmed_id)
+    
     is_email = "@" in trimmed_id
 
     customer = None
@@ -897,10 +1006,14 @@ def login_customer(req: CustomerLoginRequest, db: Session = Depends(get_db)):
         customer = db.query(CustomerModel).filter(CustomerModel.phone == clean_phone).first()
 
     if not customer or not customer.password_hash:
+        limiter.report_auth_failure(request, trimmed_id)
         raise HTTPException(status_code=401, detail="Invalid credentials or user not found.")
 
     if not verify_password(req.password, customer.password_hash):
+        limiter.report_auth_failure(request, trimmed_id)
         raise HTTPException(status_code=401, detail="Invalid password.")
+        
+    limiter.report_auth_success(request, trimmed_id)
 
     return {
         "status": "success",
@@ -916,10 +1029,12 @@ def login_customer(req: CustomerLoginRequest, db: Session = Depends(get_db)):
     }
 
 @app.post("/customers/forgot-password")
-def forgot_password(req: ForgotPasswordRequest, db: Session = Depends(get_db)):
+def forgot_password(req: ForgotPasswordRequest, request: Request, db: Session = Depends(get_db)):
     """Look up customer by email or phone, generate reset token, and send reset email."""
     trimmed_id = req.identifier.strip()
+    limiter.check_strict(request, trimmed_id)
     if not trimmed_id:
+        limiter.report_auth_failure(request, trimmed_id)
         raise HTTPException(status_code=400, detail="Email or phone number is required.")
 
     is_email = "@" in trimmed_id
@@ -970,22 +1085,28 @@ def forgot_password(req: ForgotPasswordRequest, db: Session = Depends(get_db)):
         raise HTTPException(status_code=500, detail="Failed to process password reset request.")
 
 @app.get("/customers/verify-reset-token")
-def verify_reset_token(token: str, db: Session = Depends(get_db)):
+def verify_reset_token(token: str, request: Request, db: Session = Depends(get_db)):
     """Validate whether a password reset token is valid and not expired."""
+    limiter.check_strict(request)
     if not token:
+        limiter.report_auth_failure(request)
         raise HTTPException(status_code=400, detail="Token is required.")
 
     customer = db.query(CustomerModel).filter(CustomerModel.reset_token == token.strip()).first()
     if not customer or not customer.reset_token_expiry:
+        limiter.report_auth_failure(request)
         raise HTTPException(status_code=400, detail="Invalid or expired password reset link.")
 
     try:
         expiry_dt = datetime.strptime(customer.reset_token_expiry, "%Y-%m-%d %H:%M:%S")
         if datetime.now() > expiry_dt:
+            limiter.report_auth_failure(request)
             raise HTTPException(status_code=400, detail="This reset link has expired. Please request a new one.")
     except ValueError:
+        limiter.report_auth_failure(request)
         raise HTTPException(status_code=400, detail="Invalid token expiry.")
 
+    limiter.report_auth_success(request)
     return {
         "status": "success",
         "valid": True,
@@ -994,24 +1115,30 @@ def verify_reset_token(token: str, db: Session = Depends(get_db)):
     }
 
 @app.post("/customers/reset-password")
-def reset_password(req: ResetPasswordRequest, db: Session = Depends(get_db)):
+def reset_password(req: ResetPasswordRequest, request: Request, db: Session = Depends(get_db)):
     """Reset customer password using a valid reset token."""
     token = req.token.strip()
+    limiter.check_strict(request, token)
     if not token:
+        limiter.report_auth_failure(request, token)
         raise HTTPException(status_code=400, detail="Token is required.")
 
     if len(req.new_password) < 6:
+        limiter.report_auth_failure(request, token)
         raise HTTPException(status_code=400, detail="Password must be at least 6 characters.")
 
     customer = db.query(CustomerModel).filter(CustomerModel.reset_token == token).first()
     if not customer or not customer.reset_token_expiry:
+        limiter.report_auth_failure(request, token)
         raise HTTPException(status_code=400, detail="Invalid or expired password reset link.")
 
     try:
         expiry_dt = datetime.strptime(customer.reset_token_expiry, "%Y-%m-%d %H:%M:%S")
         if datetime.now() > expiry_dt:
+            limiter.report_auth_failure(request, token)
             raise HTTPException(status_code=400, detail="This reset link has expired. Please request a new one.")
     except ValueError:
+        limiter.report_auth_failure(request, token)
         raise HTTPException(status_code=400, detail="Invalid token expiry format.")
 
     try:
@@ -1020,6 +1147,7 @@ def reset_password(req: ResetPasswordRequest, db: Session = Depends(get_db)):
         customer.reset_token_expiry = None
         customer.updated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         db.commit()
+        limiter.report_auth_success(request, token)
 
         return {
             "status": "success",
@@ -1027,10 +1155,10 @@ def reset_password(req: ResetPasswordRequest, db: Session = Depends(get_db)):
         }
     except Exception as e:
         db.rollback()
-        print(f"Error resetting password: {e}")
+        logging.error(f"Error resetting password: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Failed to update password.")
 
-@app.get("/customers/{customer_id}/orders")
+@app.get("/customers/{customer_id}/orders", dependencies=[Depends(loose_limiter)])
 def get_customer_orders(customer_id: str, db: Session = Depends(get_db)):
     """Retrieve all historical orders for a specific customer by customer_id or phone."""
     cid = customer_id.strip()
@@ -1139,10 +1267,11 @@ async def get_delivery_quote(order_id: str, req: DeliveryQuoteRequest, db: Sessi
             "vehicle_type": quote.vehicle_type,
         }
     except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        logging.error(f"Error getting delivery quote: {e}", exc_info=True)
+        raise HTTPException(status_code=400, detail="Failed to get delivery quote. Please check your request.")
     except Exception as e:
-        print(f"Error getting delivery quote: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to get delivery quote: {str(e)}")
+        logging.error(f"Error getting delivery quote: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to get delivery quote. Please try again later.")
 
 
 @app.post("/admin/orders/{order_id}/dispatch")
@@ -1230,11 +1359,11 @@ async def dispatch_delivery(order_id: str, req: DeliveryDispatchRequest, db: Ses
             "message": f"Delivery dispatched successfully via {result.provider}"
         }
     except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        logging.error(f"Error dispatching delivery: {e}", exc_info=True)
+        raise HTTPException(status_code=400, detail="Failed to dispatch delivery. Please check the order details.")
     except Exception as e:
-        db.rollback()
-        print(f"Error dispatching delivery: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to dispatch delivery: {str(e)}")
+        logging.error(f"Error dispatching delivery: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to dispatch delivery. Please try again later.")
 
 
 @app.get("/admin/orders/{order_id}/delivery")
@@ -1325,8 +1454,8 @@ async def cancel_order_delivery(order_id: str, db: Session = Depends(get_db)):
         raise
     except Exception as e:
         db.rollback()
-        print(f"Error cancelling delivery: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to cancel delivery: {str(e)}")
+        logging.error(f"Error canceling delivery: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to cancel delivery. Please try again later.")
 
 
 @app.get("/admin/deliveries")
@@ -1438,7 +1567,7 @@ def update_delivery_status_manual(delivery_id: str, req: OrderStatusUpdate, db: 
 
 
 
-@app.post("/api/create-order")
+@app.post("/api/create-order", dependencies=[Depends(moderate_limiter)])
 def create_razorpay_order(req: CreateOrderRequest):
     """Create order record identifier in Razorpay gateway client."""
     if not razorpay_client:
@@ -1461,10 +1590,10 @@ def create_razorpay_order(req: CreateOrderRequest):
             "currency": order["currency"]
         }
     except Exception as e:
-        print(f"Razorpay API Error: {e}")
-        raise HTTPException(status_code=500, detail=f"Razorpay API Order creation failed: {str(e)}")
+        logging.error(f"Razorpay API Order creation failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to create payment order. Please try again later.")
 
-@app.post("/api/verify-payment")
+@app.post("/api/verify-payment", dependencies=[Depends(moderate_limiter)])
 def verify_payment_signature(req: VerifyPaymentRequest):
     """Verify cryptographic validity of payment signature generated client-side."""
     if not RAZORPAY_KEY_SECRET:
@@ -1484,5 +1613,106 @@ def verify_payment_signature(req: VerifyPaymentRequest):
         else:
             raise HTTPException(status_code=400, detail="Signature mismatch validation error")
     except Exception as e:
-        print(f"Verification Failure: {e}")
-        raise HTTPException(status_code=400, detail=str(e))
+        logging.error(f"Razorpay payment verification failed: {e}", exc_info=True)
+        raise HTTPException(status_code=400, detail="Payment verification failed.")
+
+# -----------------------------------------------------------------------------
+# Secure File Upload Pipeline
+# -----------------------------------------------------------------------------
+# Isolated storage directory strictly outside web root (public/dist)
+UPLOAD_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "storage", "uploads"))
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+ALLOWED_IMAGE_SIGNATURES = {
+    b"\xff\xd8\xff": ("image/jpeg", ".jpg"),
+    b"\x89PNG\r\n\x1a\n": ("image/png", ".png"),
+}
+MAX_FILE_SIZE = 5 * 1024 * 1024  # 5 MB
+
+@app.post("/api/upload", dependencies=[Depends(moderate_limiter)])
+async def upload_file(request: Request, file: UploadFile = File(...)):
+    """
+    Secure file upload:
+    - Validates file content using magic byte signatures (JPEG, PNG, WEBP)
+    - Enforces 5MB size limit
+    - Rejects executable files, scripts, and disguised extensions
+    - Stores file in isolated storage directory outside web root
+    - Generates randomized UUID filename and sets permissions to 0o644 (non-executable)
+    """
+    header = await file.read(2048)
+    if len(header) == 0:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+
+    detected_mime = None
+    safe_ext = None
+
+    for signature, (mime, ext) in ALLOWED_IMAGE_SIGNATURES.items():
+        if header.startswith(signature):
+            detected_mime = mime
+            safe_ext = ext
+            break
+
+    # Check for WEBP: starts with RIFF and has WEBP at offset 8
+    if not detected_mime and header.startswith(b"RIFF") and len(header) >= 12 and header[8:12] == b"WEBP":
+        detected_mime = "image/webp"
+        safe_ext = ".webp"
+
+    if not detected_mime:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid file format. Only JPEG, PNG, and WEBP images are permitted. Executable files and scripts are strictly forbidden."
+        )
+
+    random_filename = f"{secrets.token_hex(16)}{safe_ext}"
+    safe_path = os.path.join(UPLOAD_DIR, random_filename)
+
+    total_size = len(header)
+    with open(safe_path, "wb") as f:
+        f.write(header)
+        while chunk := await file.read(1024 * 1024):
+            total_size += len(chunk)
+            if total_size > MAX_FILE_SIZE:
+                f.close()
+                if os.path.exists(safe_path):
+                    os.remove(safe_path)
+                raise HTTPException(status_code=413, detail="File exceeds maximum allowed size (5MB).")
+            f.write(chunk)
+
+    # Enforce non-executable permissions
+    try:
+        os.chmod(safe_path, 0o644)
+    except Exception:
+        pass
+
+    return {
+        "status": "success",
+        "filename": random_filename,
+        "url": f"/api/uploads/{random_filename}",
+        "mime_type": detected_mime,
+        "size": total_size
+    }
+
+@app.get("/api/uploads/{filename}")
+async def get_uploaded_file(filename: str):
+    """Safely serve uploaded file preventing directory traversal and disabling MIME sniffing."""
+    clean_filename = os.path.basename(filename)
+    file_path = os.path.join(UPLOAD_DIR, clean_filename)
+
+    if not os.path.isfile(file_path):
+        raise HTTPException(status_code=404, detail="File not found.")
+
+    return FileResponse(
+        path=file_path,
+        headers={
+            "X-Content-Type-Options": "nosniff",
+            "Content-Security-Policy": "default-src 'none'",
+            "Content-Disposition": f'inline; filename="{clean_filename}"'
+        }
+    )
+
+@app.post("/api/test/reset-rate-limits")
+def reset_rate_limits():
+    """Reset rate limiter records for automated testing."""
+    limiter.reset_all()
+    return {"status": "ok", "message": "Rate limit records reset successfully."}
+

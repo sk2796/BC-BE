@@ -11,3 +11,4 @@ cryptography
 bcrypt
 passlib
 httpx
+python-multipart
